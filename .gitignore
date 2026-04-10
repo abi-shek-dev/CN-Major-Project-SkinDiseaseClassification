@@ -4,5 +4,6 @@ backend/__pycache__/
 frontend/__pycache__/
 *.pyc
 *.h5
+*.pth
 backend/class_names.json
 backend/training_metrics.json

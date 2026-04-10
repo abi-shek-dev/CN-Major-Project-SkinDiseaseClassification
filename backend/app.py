@@ -3,10 +3,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+import torch
 from flask import Flask, jsonify, request, send_from_directory
 from PIL import Image, UnidentifiedImageError
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing import image
+from torchvision import transforms
+from torchvision.models import mobilenet_v2
 
 try:
     from .label_info import DEFAULT_CLASS_ORDER, describe_class
@@ -15,16 +16,24 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR.parent / "frontend"
-MODEL_PATH = BASE_DIR / "skin_model.h5"
+MODEL_PATH = BASE_DIR / "skin_model.pth"
 CLASS_NAMES_PATH = BASE_DIR / "class_names.json"
 MAX_IMAGE_SIZE_BYTES = 8 * 1024 * 1024
-IMAGE_SIZE = (224, 224)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+INFERENCE_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]
+)
 
 app = Flask(__name__, static_folder=str(FRONTEND_DIR), static_url_path="")
 app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_SIZE_BYTES
 
 _model = None
 _model_error = None
+_checkpoint = None
 
 
 def load_class_names():
@@ -45,7 +54,7 @@ class_names = load_class_names()
 
 
 def get_model():
-    global _model, _model_error
+    global _model, _model_error, _checkpoint, class_names
     if _model is not None:
         return _model
     if _model_error is not None:
@@ -58,20 +67,24 @@ def get_model():
         raise RuntimeError(_model_error)
 
     try:
-        _model = load_model(MODEL_PATH)
+        _checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+        class_names = _checkpoint.get("class_order", class_names)
+        _model = mobilenet_v2(weights=None)
+        in_features = _model.classifier[1].in_features
+        _model.classifier[1] = torch.nn.Linear(in_features, len(class_names))
+        _model.load_state_dict(_checkpoint["model_state_dict"])
+        _model.to(DEVICE)
+        _model.eval()
         return _model
-    except Exception as exc:  # pragma: no cover - depends on local TF runtime
+    except Exception as exc:  # pragma: no cover - depends on local runtime
         _model_error = f"Failed to load model: {exc}"
         raise RuntimeError(_model_error) from exc
 
 
-def prepare_image(img, target_size=IMAGE_SIZE):
+def prepare_image(img):
     if img.mode != "RGB":
         img = img.convert("RGB")
-    img = img.resize(target_size)
-    img_array = image.img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array / 255.0
+    return INFERENCE_TRANSFORM(img).unsqueeze(0).to(DEVICE)
 
 
 def format_top_predictions(predictions):
@@ -119,6 +132,7 @@ def health():
             "status": "ok",
             "modelReady": model_ready,
             "modelPath": str(MODEL_PATH),
+            "device": str(DEVICE),
             "classCount": len(class_names),
             "classes": [describe_class(code) for code in class_names],
             "error": error_message,
@@ -151,10 +165,11 @@ def predict():
             return jsonify({"error": "Uploaded file is empty."}), 400
 
         img = Image.open(io.BytesIO(image_bytes))
-        img_array = prepare_image(img)
+        img_tensor = prepare_image(img)
 
-        prediction_batch = model.predict(img_array, verbose=0)
-        predictions = prediction_batch[0]
+        with torch.no_grad():
+            logits = model(img_tensor)
+            predictions = torch.softmax(logits, dim=1).cpu().numpy()[0]
         predicted_index = int(np.argmax(predictions))
         predicted_code = class_names[predicted_index]
         predicted_details = describe_class(predicted_code)

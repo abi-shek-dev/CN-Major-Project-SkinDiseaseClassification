@@ -1,18 +1,21 @@
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import torch
+from PIL import Image
 from sklearn.metrics import accuracy_score, classification_report, f1_score, precision_score, recall_score
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from torch import nn
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from torchvision import transforms
+from torchvision.models import MobileNet_V2_Weights, mobilenet_v2
 
 try:
     from .label_info import CLASS_DETAILS, DEFAULT_CLASS_ORDER, describe_class
@@ -20,6 +23,43 @@ except ImportError:
     from label_info import CLASS_DETAILS, DEFAULT_CLASS_ORDER, describe_class
 
 RANDOM_SEED = 42
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TRAIN_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize((256, 256)),
+        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(20),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]
+)
+VAL_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]
+)
+
+
+class HAM10000Dataset(Dataset):
+    def __init__(self, dataframe, class_to_index, transform):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.class_to_index = class_to_index
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, index):
+        row = self.dataframe.iloc[index]
+        image = Image.open(row["filepath"]).convert("RGB")
+        tensor = self.transform(image)
+        label = self.class_to_index[row["label"]]
+        return tensor, label
 
 
 def get_default_paths():
@@ -29,22 +69,12 @@ def get_default_paths():
     return csv_path, data_dir
 
 
-def build_model(num_classes, input_shape=(224, 224, 3)):
-    backbone = MobileNetV2(weights="imagenet", include_top=False, input_shape=input_shape, pooling="avg")
-    backbone.trainable = True
-
-    x = backbone.output
-    x = Dropout(0.35)(x)
-    x = Dense(128, activation="relu")(x)
-    x = Dropout(0.25)(x)
-    output = Dense(num_classes, activation="softmax")(x)
-
-    model = Model(inputs=backbone.input, outputs=output)
-    model.compile(
-        optimizer=Adam(learning_rate=1e-4),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"],
-    )
+def build_model(num_classes, use_pretrained=True):
+    weights = MobileNet_V2_Weights.DEFAULT if use_pretrained else None
+    model = mobilenet_v2(weights=weights)
+    in_features = model.classifier[1].in_features
+    model.classifier[1] = nn.Linear(in_features, num_classes)
+    model.to(DEVICE)
     return model
 
 
@@ -98,46 +128,69 @@ def stratified_split(df, train_ratio=0.8):
     return train_df, val_df
 
 
-def create_data_generators(train_df, val_df, target_size=(224, 224), batch_size=32):
-    train_gen = ImageDataGenerator(
-        rescale=1.0 / 255.0,
-        rotation_range=25,
-        width_shift_range=0.1,
-        height_shift_range=0.1,
-        zoom_range=0.2,
-        horizontal_flip=True,
-        vertical_flip=True,
-        brightness_range=(0.9, 1.1),
-        fill_mode="nearest",
+def create_data_loaders(train_df, val_df, batch_size=32):
+    class_order = list(DEFAULT_CLASS_ORDER)
+    class_to_index = {label: index for index, label in enumerate(class_order)}
+    train_dataset = HAM10000Dataset(train_df, class_to_index, TRAIN_TRANSFORM)
+    val_dataset = HAM10000Dataset(val_df, class_to_index, VAL_TRANSFORM)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    return train_loader, val_loader, class_order
+
+
+def run_epoch(model, data_loader, criterion, epoch_number, total_epochs, phase, optimizer=None):
+    is_training = optimizer is not None
+    model.train(is_training)
+
+    total_loss = 0.0
+    all_targets = []
+    all_predictions = []
+
+    progress_bar = tqdm(
+        data_loader,
+        desc=f"Epoch {epoch_number}/{total_epochs} [{phase}]",
+        leave=False,
+        dynamic_ncols=True,
     )
-    val_gen = ImageDataGenerator(rescale=1.0 / 255.0)
 
-    flow_args = {
-        "x_col": "filepath",
-        "y_col": "label",
-        "target_size": target_size,
-        "class_mode": "categorical",
-        "batch_size": batch_size,
-        "classes": DEFAULT_CLASS_ORDER,
-    }
+    for inputs, labels in progress_bar:
+        inputs = inputs.to(DEVICE)
+        labels = labels.to(DEVICE)
 
-    train_flow = train_gen.flow_from_dataframe(
-        train_df,
-        shuffle=True,
-        **flow_args,
+        if is_training:
+            optimizer.zero_grad()
+
+        with torch.set_grad_enabled(is_training):
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            if is_training:
+                loss.backward()
+                optimizer.step()
+
+        total_loss += loss.item() * inputs.size(0)
+        all_targets.extend(labels.detach().cpu().tolist())
+        all_predictions.extend(torch.argmax(outputs, dim=1).detach().cpu().tolist())
+
+        running_loss = total_loss / max(len(all_targets), 1)
+        running_accuracy = accuracy_score(all_targets, all_predictions) if all_targets else 0.0
+        progress_bar.set_postfix(loss=f"{running_loss:.4f}", acc=f"{running_accuracy:.4f}")
+
+    average_loss = total_loss / max(len(data_loader.dataset), 1)
+    accuracy = accuracy_score(all_targets, all_predictions) if all_targets else 0.0
+    return average_loss, accuracy, all_targets, all_predictions
+
+
+def evaluate_model(model, val_loader, class_order):
+    criterion = nn.CrossEntropyLoss()
+    _, _, true_indices, predicted_indices = run_epoch(
+        model,
+        val_loader,
+        criterion,
+        epoch_number="final",
+        total_epochs="eval",
+        phase="evaluation",
+        optimizer=None,
     )
-    val_flow = val_gen.flow_from_dataframe(
-        val_df,
-        shuffle=False,
-        **flow_args,
-    )
-    return train_flow, val_flow
-
-
-def evaluate_model(model, val_flow, class_order):
-    probabilities = model.predict(val_flow, verbose=1)
-    predicted_indices = np.argmax(probabilities, axis=1)
-    true_indices = val_flow.classes
     predicted_labels = [class_order[index] for index in predicted_indices]
     true_labels = [class_order[index] for index in true_indices]
 
@@ -173,7 +226,7 @@ def save_class_metadata(class_order, output_path):
 
 def save_metrics(history, metrics, output_path):
     payload = {
-        "history": {key: [round(float(value), 6) for value in values] for key, values in history.history.items()},
+        "history": {key: [round(float(value), 6) for value in values] for key, values in history.items()},
         "metrics": metrics,
     }
     with open(output_path, "w", encoding="utf-8") as file:
@@ -193,31 +246,81 @@ def train(csv_path, image_dir, model_path, class_names_path, metrics_path, epoch
     print("Training images:", len(train_df))
     print("Validation images:", len(val_df))
 
-    train_flow, val_flow = create_data_generators(train_df, val_df, batch_size=batch_size)
-    class_order = list(train_flow.class_indices.keys())
+    train_loader, val_loader, class_order = create_data_loaders(train_df, val_df, batch_size=batch_size)
     print("Training classes:", class_order)
+    print("Training device:", DEVICE)
 
     model = build_model(len(class_order))
-    callbacks = [
-        ModelCheckpoint(model_path, monitor="val_accuracy", save_best_only=True, verbose=1),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, verbose=1),
-        EarlyStopping(monitor="val_loss", patience=4, restore_best_weights=True, verbose=1),
-    ]
+    criterion = nn.CrossEntropyLoss()
+    optimizer = Adam(model.parameters(), lr=1e-4)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
-    history = model.fit(
-        train_flow,
-        validation_data=val_flow,
-        epochs=epochs,
-        callbacks=callbacks,
-    )
+    history = {"train_loss": [], "train_accuracy": [], "val_loss": [], "val_accuracy": []}
+    best_val_accuracy = -1.0
+    best_state_dict = None
+    stagnant_epochs = 0
+    early_stopping_patience = 4
+
+    for epoch in range(epochs):
+        train_loss, train_accuracy, _, _ = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            epoch_number=epoch + 1,
+            total_epochs=epochs,
+            phase="train",
+            optimizer=optimizer,
+        )
+        val_loss, val_accuracy, _, _ = run_epoch(
+            model,
+            val_loader,
+            criterion,
+            epoch_number=epoch + 1,
+            total_epochs=epochs,
+            phase="val",
+            optimizer=None,
+        )
+        scheduler.step(val_loss)
+
+        history["train_loss"].append(train_loss)
+        history["train_accuracy"].append(train_accuracy)
+        history["val_loss"].append(val_loss)
+        history["val_accuracy"].append(val_accuracy)
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} "
+            f"- train_loss: {train_loss:.4f} "
+            f"- train_accuracy: {train_accuracy:.4f} "
+            f"- val_loss: {val_loss:.4f} "
+            f"- val_accuracy: {val_accuracy:.4f}"
+        )
+
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            best_state_dict = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+            stagnant_epochs = 0
+        else:
+            stagnant_epochs += 1
+            if stagnant_epochs >= early_stopping_patience:
+                print("Early stopping triggered.")
+                break
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "class_order": class_order,
+        "device_used_for_training": str(DEVICE),
+    }
 
     print("Saving final model to:", model_path)
-    model.save(model_path)
+    torch.save(checkpoint, model_path)
 
     save_class_metadata(class_order, class_names_path)
     print("Saved class metadata to:", class_names_path)
 
-    metrics = evaluate_model(model, val_flow, class_order)
+    metrics = evaluate_model(model, val_loader, class_order)
     save_metrics(history, metrics, metrics_path)
     print("Saved metrics to:", metrics_path)
     print(json.dumps(metrics, indent=2))
@@ -238,8 +341,11 @@ def parse_args():
 
 
 def main():
-    tf.random.set_seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(RANDOM_SEED)
 
     args = parse_args()
     default_csv, default_image_dir = get_default_paths()
@@ -247,7 +353,7 @@ def main():
 
     csv_path = Path(args.csv_path) if args.csv_path else default_csv
     image_dir = Path(args.image_dir) if args.image_dir else default_image_dir
-    model_path = Path(args.model_path) if args.model_path else base_dir / "skin_model.h5"
+    model_path = Path(args.model_path) if args.model_path else base_dir / "skin_model.pth"
     class_names_path = Path(args.classes_path) if args.classes_path else base_dir / "class_names.json"
     metrics_path = Path(args.metrics_path) if args.metrics_path else base_dir / "training_metrics.json"
 
